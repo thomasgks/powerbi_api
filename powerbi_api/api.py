@@ -52,6 +52,15 @@ def _check():
 	frappe.only_for(ROLES)
 
 
+def _col(doctype, alias, field):
+	"""`alias`.`field` if the column exists on this site, else NULL (custom fields vary per site)."""
+	return f"{alias}.`{field}`" if frappe.db.has_column(doctype, field) else "NULL"
+
+
+def _doc_no():
+	return "se.custom_doc_no"  # "Doc No" on Stock Entry (Slip# Animo)
+
+
 def _page(limit, offset):
 	limit = min(max(cint(limit) or DEFAULT_LIMIT, 1), MAX_LIMIT)
 	offset = max(cint(offset), 0)
@@ -101,8 +110,8 @@ def sales(from_date=None, to_date=None, limit=None, offset=None, docstatus=None)
 	rows = frappe.db.sql(
 		f"""
 		SELECT p.name AS receipt_no, p.posting_date, p.status,
-			COALESCE(NULLIF(p.custom_store,''), NULLIF(i.warehouse,''), p.set_warehouse) AS store,
-			p.{SALES_INVOICE_ANIMO_FIELD} AS animo_ref, p.customer_name, p.contact_mobile,
+			COALESCE(NULLIF(i.warehouse,''), p.set_warehouse) AS store,
+			{_col("Sales Invoice", "p", SALES_INVOICE_ANIMO_FIELD)} AS animo_ref, p.customer_name, p.contact_mobile,
 			p.address_display, p.total_taxes_and_charges AS doc_tax, p.net_total AS doc_net_total,
 			i.idx, i.item_code, i.qty, i.net_amount, i.discount_amount, i.distributed_discount_amount,
 			i.pricing_rules, i.incoming_rate AS cost
@@ -201,7 +210,7 @@ def _adjustment_slip_sql():
 	params = {f"ap{i}": f"{p}%" for i, p in enumerate(ADJUSTMENT_DOC_PREFIXES)}
 	if not params:
 		return None, {}
-	cond = " OR ".join(f"IFNULL(se.custom_doc_no,'') LIKE %({k})s" for k in params)
+	cond = " OR ".join(f"IFNULL({_doc_no()},'') LIKE %({k})s" for k in params)
 	return f"({cond})", params
 
 
@@ -239,7 +248,7 @@ def transfers(from_date=None, to_date=None, limit=None, offset=None, docstatus=N
 	to_wh = "COALESCE(NULLIF(d.t_warehouse,''), se.to_warehouse)"
 	rows = frappe.db.sql(
 		f"""
-		SELECT se.name AS slip_erp, se.custom_doc_no AS slip_animo, {_STATUS_SQL} AS status,
+		SELECT se.name AS slip_erp, {_doc_no()} AS slip_animo, {_STATUS_SQL} AS status,
 			se.posting_date, {from_wh} AS from_store, {to_wh} AS to_store,
 			d.item_code, d.transfer_qty AS qty, d.basic_rate AS cost, d.idx,
 			CASE se.stock_entry_type WHEN 'Material Issue' THEN 'OUT'
@@ -332,7 +341,7 @@ def adjustments(from_date=None, to_date=None, limit=None, offset=None, docstatus
 	se_branch = ""
 	if adj_sql:  # Stock Entry adjustments only exist when ADJUSTMENT_DOC_PREFIXES is set
 		se_branch = f"""
-			SELECT se.name AS slip_erp, se.custom_doc_no AS slip_animo, {status.format(t='se')} AS status,
+			SELECT se.name AS slip_erp, {_doc_no()} AS slip_animo, {status.format(t='se')} AS status,
 				se.posting_date, {se_store} AS store, d.item_code,
 				{se_after} - {se_adj} AS oh_qty, {se_adj} AS adj_qty, d.basic_rate AS cost,
 				IF(se.is_opening = 'Yes', {se_adj}, NULL) AS opening_stock,

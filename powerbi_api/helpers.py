@@ -10,6 +10,25 @@ PRICE_LISTS = {
 }
 
 
+ITEM_CUSTOM_FIELDS = (
+	"custom_style_code",
+	"custom_item_name_ar",
+	"custom_material",
+	"custom_image_url",
+	"custom_bin_no",
+	"custom_dcs",
+	"custom_vendor_code",
+	"custom_vendor_name",
+)
+
+
+def _custom_cols():
+	"""Item custom fields to select; any that don't exist on this site come back as NULL."""
+	return ", ".join(
+		f"`{f}`" if frappe.db.has_column("Item", f) else f"NULL AS `{f}`" for f in ITEM_CUSTOM_FIELDS
+	)
+
+
 def _chunks(seq, n=CHUNK):
 	seq = list(seq)
 	for i in range(0, len(seq), n):
@@ -32,9 +51,8 @@ def get_item_map(item_codes):
 	res = {}
 	for chunk in _chunks(codes):
 		for r in frappe.db.sql(
-			"""SELECT name, item_name, brand, item_group, variant_of, custom_style_code,
-				custom_item_name_ar, description, custom_material, custom_image_url, custom_bin_no,
-				custom_dcs, custom_vendor_code, custom_vendor_name, valuation_rate, is_stock_item
+			f"""SELECT name, item_name, brand, item_group, variant_of, description, valuation_rate,
+				is_stock_item, {_custom_cols()}
 			FROM `tabItem` WHERE name IN %(c)s""",
 			{"c": chunk},
 			as_dict=True,
