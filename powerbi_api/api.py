@@ -33,9 +33,14 @@ MAX_LIMIT = 50000
 DEFAULT_LIMIT = 10000
 
 # Which Sales Invoice column carries the Animo reference. Change here if the
-# reference is stored elsewhere. POS Invoices use custom_billno.
+# reference is stored elsewhere.
 SALES_INVOICE_ANIMO_FIELD = "po_no"
-POS_INVOICE_ANIMO_FIELD = "custom_billno"
+
+# Transfers are Stock Entries of type Material Receipt (transfer in), Material Issue
+# (transfer out) and Material Transfer. If some Receipt/Issue entries are really stock
+# adjustments, list their custom_doc_no ("Doc No") prefixes here, e.g. ("ADJ.",). Those
+# entries are then reported by the adjustments endpoint instead of transfers.
+ADJUSTMENT_DOC_PREFIXES = ()
 
 DOCSTATUS_LABEL = {0: "Draft", 1: "Submitted", 2: "Cancelled"}
 
@@ -86,46 +91,26 @@ def _addr(html):
 # --------------------------------------------------------------------------
 # Sales
 # --------------------------------------------------------------------------
-def _sales_select(dt, animo_field, store_expr, cost_expr, extra_where):
-	return f"""
-		SELECT p.name AS receipt_no, p.posting_date, p.status, {store_expr} AS store,
-			p.{animo_field} AS animo_ref, p.customer_name, p.contact_mobile, p.address_display,
-			p.is_return, p.total_taxes_and_charges AS doc_tax, p.net_total AS doc_net_total,
-			i.idx, i.item_code, i.qty, i.net_amount, i.discount_amount, i.distributed_discount_amount,
-			i.pricing_rules, {cost_expr} AS cost, '{dt}' AS doctype
-		FROM `tab{dt}` p
-		JOIN `tab{dt} Item` i ON i.parent = p.name
-		WHERE p.docstatus IN %(docstatus)s
-			AND p.posting_date BETWEEN %(from_date)s AND %(to_date)s
-			{extra_where}
-	"""
-
-
 @frappe.whitelist()
 def sales(from_date=None, to_date=None, limit=None, offset=None, docstatus=None):
-	"""One row per invoice line from POS Invoice + Sales Invoice.
-
-	Consolidated Sales Invoices (created from POS closing) are skipped because
-	their lines already exist as POS Invoices, so nothing is counted twice.
-	"""
+	"""One row per Sales Invoice line (returns come through with negative qty/amounts)."""
 	_check()
 	limit, offset = _page(limit, offset)
 	fd, td = _dates(from_date, to_date)
 
-	pos = _sales_select(
-		"POS Invoice", POS_INVOICE_ANIMO_FIELD, "COALESCE(NULLIF(i.warehouse,''), p.set_warehouse)", "0", ""
-	)
-	inv = _sales_select(
-		"Sales Invoice",
-		SALES_INVOICE_ANIMO_FIELD,
-		"COALESCE(NULLIF(p.custom_store,''), NULLIF(i.warehouse,''), p.set_warehouse)",
-		"i.incoming_rate",
-		"AND p.is_consolidated = 0",
-	)
 	rows = frappe.db.sql(
 		f"""
-		SELECT * FROM ({pos} UNION ALL {inv}) t
-		ORDER BY posting_date, receipt_no, idx
+		SELECT p.name AS receipt_no, p.posting_date, p.status,
+			COALESCE(NULLIF(p.custom_store,''), NULLIF(i.warehouse,''), p.set_warehouse) AS store,
+			p.{SALES_INVOICE_ANIMO_FIELD} AS animo_ref, p.customer_name, p.contact_mobile,
+			p.address_display, p.total_taxes_and_charges AS doc_tax, p.net_total AS doc_net_total,
+			i.idx, i.item_code, i.qty, i.net_amount, i.discount_amount, i.distributed_discount_amount,
+			i.pricing_rules, i.incoming_rate AS cost
+		FROM `tabSales Invoice` p
+		JOIN `tabSales Invoice Item` i ON i.parent = p.name
+		WHERE p.docstatus IN %(docstatus)s
+			AND p.posting_date BETWEEN %(from_date)s AND %(to_date)s
+		ORDER BY p.posting_date, p.name, i.idx
 		LIMIT %(lim)s OFFSET %(offset)s
 		""",
 		{
@@ -140,7 +125,7 @@ def sales(from_date=None, to_date=None, limit=None, offset=None, docstatus=None)
 	page = rows[:limit]
 
 	items = get_item_map({r.item_code for r in page})
-	pay = _payment_types({(r.doctype, r.receipt_no) for r in page})
+	pay = _payment_types({r.receipt_no for r in page})
 
 	out = []
 	for r in page:
@@ -184,34 +169,40 @@ def sales(from_date=None, to_date=None, limit=None, offset=None, docstatus=None)
 				"Customer name": r.customer_name,
 				"Mobile no.": r.contact_mobile,
 				"Bill address": _addr(r.address_display),
-				"Payment type": pay.get((r.doctype, r.receipt_no), ""),
+				"Payment type": pay.get(r.receipt_no, ""),
 				"Promo code": r.pricing_rules or "",
 			}
 		)
 	return _envelope(out + rows[limit:], limit, offset)
 
 
-def _payment_types(keys):
-	if not keys:
+def _payment_types(names):
+	if not names:
 		return {}
-	names = tuple({k[1] for k in keys})
 	rows = frappe.db.sql(
 		"""
-		SELECT parenttype, parent, mode_of_payment
-		FROM `tabSales Invoice Payment`
-		WHERE parent IN %(names)s AND parenttype IN ('POS Invoice','Sales Invoice')
-			AND amount != 0
+		SELECT parent, mode_of_payment FROM `tabSales Invoice Payment`
+		WHERE parent IN %(names)s AND parenttype = 'Sales Invoice' AND amount != 0
 		ORDER BY idx
 		""",
-		{"names": names},
+		{"names": tuple(names)},
 		as_dict=True,
 	)
 	res = {}
 	for r in rows:
-		cur = res.setdefault((r.parenttype, r.parent), [])
+		cur = res.setdefault(r.parent, [])
 		if r.mode_of_payment not in cur:
 			cur.append(r.mode_of_payment)
 	return {k: ", ".join(v) for k, v in res.items()}
+
+
+def _adjustment_slip_sql():
+	"""(SQL, params) matching Stock Entries whose Doc No has an adjustment prefix, or (None, {})."""
+	params = {f"ap{i}": f"{p}%" for i, p in enumerate(ADJUSTMENT_DOC_PREFIXES)}
+	if not params:
+		return None, {}
+	cond = " OR ".join(f"IFNULL(se.custom_doc_no,'') LIKE %({k})s" for k in params)
+	return f"({cond})", params
 
 
 # --------------------------------------------------------------------------
@@ -229,7 +220,11 @@ _STATUS_SQL = """CASE se.docstatus WHEN 0 THEN 'Draft' WHEN 2 THEN 'Cancelled'
 
 @frappe.whitelist()
 def transfers(from_date=None, to_date=None, limit=None, offset=None, docstatus=None):
-	"""One row per Stock Entry line with purpose 'Material Transfer'.
+	"""One row per Stock Entry line that is a stock transfer.
+
+	Stock Entry Type Material Issue = transfer out (from store only), Material Receipt =
+	transfer in (to store only), Material Transfer = both stores. "Direction" says which
+	(OUT / IN / TRANSFER) so the two legs can be paired in Power BI.
 
 	from/to store OH = stock on hand in that warehouse right after the entry
 	(from the Stock Ledger), not today's balance.
@@ -238,6 +233,8 @@ def transfers(from_date=None, to_date=None, limit=None, offset=None, docstatus=N
 	limit, offset = _page(limit, offset)
 	fd, td = _dates(from_date, to_date)
 
+	adj_sql, adj_params = _adjustment_slip_sql()
+	not_adj = f"AND NOT {adj_sql}" if adj_sql else ""
 	from_wh = "COALESCE(NULLIF(d.s_warehouse,''), se.from_warehouse)"
 	to_wh = "COALESCE(NULLIF(d.t_warehouse,''), se.to_warehouse)"
 	rows = frappe.db.sql(
@@ -245,16 +242,21 @@ def transfers(from_date=None, to_date=None, limit=None, offset=None, docstatus=N
 		SELECT se.name AS slip_erp, se.custom_doc_no AS slip_animo, {_STATUS_SQL} AS status,
 			se.posting_date, {from_wh} AS from_store, {to_wh} AS to_store,
 			d.item_code, d.transfer_qty AS qty, d.basic_rate AS cost, d.idx,
+			CASE se.stock_entry_type WHEN 'Material Issue' THEN 'OUT'
+				WHEN 'Material Receipt' THEN 'IN' ELSE 'TRANSFER' END AS direction,
 			{_SLE_AFTER.format(v="se", wh=from_wh)} AS from_oh,
 			{_SLE_AFTER.format(v="se", wh=to_wh)} AS to_oh
 		FROM `tabStock Entry` se
 		JOIN `tabStock Entry Detail` d ON d.parent = se.name
-		WHERE se.purpose = 'Material Transfer' AND se.docstatus IN %(docstatus)s
+		WHERE se.stock_entry_type IN ('Material Transfer','Material Receipt','Material Issue')
+			{not_adj}
+			AND se.docstatus IN %(docstatus)s
 			AND se.posting_date BETWEEN %(from_date)s AND %(to_date)s
 		ORDER BY se.posting_date, se.name, d.idx
 		LIMIT %(lim)s OFFSET %(offset)s
 		""",
 		{
+			**adj_params,
 			"docstatus": _docstatus(docstatus),
 			"from_date": fd,
 			"to_date": td,
@@ -277,6 +279,7 @@ def transfers(from_date=None, to_date=None, limit=None, offset=None, docstatus=N
 				"Slip# ERP": r.slip_erp,
 				"Status": r.status,
 				"Transfer date": r.posting_date,
+				"Direction": r.direction,
 				"VC": g["vc"],
 				"Vendor Name": g["vendor_name"],
 				"Brand": g["brand"],
@@ -311,7 +314,8 @@ def transfers(from_date=None, to_date=None, limit=None, offset=None, docstatus=N
 # --------------------------------------------------------------------------
 @frappe.whitelist()
 def adjustments(from_date=None, to_date=None, limit=None, offset=None, docstatus=None):
-	"""Stock adjustments: Material Receipt / Material Issue entries and Stock Reconciliations.
+	"""Stock adjustments: Stock Reconciliations, plus Material Receipt / Material Issue entries
+	whose Doc No starts with a prefix in ADJUSTMENT_DOC_PREFIXES (none by default).
 
 	OH Qty = quantity on hand before the adjustment; adj qty = signed change.
 	"""
@@ -319,27 +323,36 @@ def adjustments(from_date=None, to_date=None, limit=None, offset=None, docstatus
 	limit, offset = _page(limit, offset)
 	fd, td = _dates(from_date, to_date)
 
+	adj_sql, adj_params = _adjustment_slip_sql()
 	se_store = "COALESCE(NULLIF(d.t_warehouse,''), NULLIF(d.s_warehouse,''))"
 	se_after = _SLE_AFTER.format(v="se", wh=se_store)
 	se_adj = "IF(IFNULL(d.t_warehouse,'') != '', d.transfer_qty, -d.transfer_qty)"
 	status = "CASE {t}.docstatus WHEN 0 THEN 'Draft' WHEN 1 THEN 'Submitted' ELSE 'Cancelled' END"
 
-	rows = frappe.db.sql(
-		f"""
-		SELECT * FROM (
+	se_branch = ""
+	if adj_sql:  # Stock Entry adjustments only exist when ADJUSTMENT_DOC_PREFIXES is set
+		se_branch = f"""
 			SELECT se.name AS slip_erp, se.custom_doc_no AS slip_animo, {status.format(t='se')} AS status,
 				se.posting_date, {se_store} AS store, d.item_code,
 				{se_after} - {se_adj} AS oh_qty, {se_adj} AS adj_qty, d.basic_rate AS cost,
 				IF(se.is_opening = 'Yes', {se_adj}, NULL) AS opening_stock,
-				se.purpose AS adj_type, d.idx
+				se.stock_entry_type AS adj_type, d.idx
 			FROM `tabStock Entry` se
 			JOIN `tabStock Entry Detail` d ON d.parent = se.name
-			WHERE se.purpose IN ('Material Receipt','Material Issue') AND se.docstatus IN %(docstatus)s
+			WHERE se.stock_entry_type IN ('Material Receipt','Material Issue') AND {adj_sql}
+				AND se.docstatus IN %(docstatus)s
 				AND se.posting_date BETWEEN %(from_date)s AND %(to_date)s
-			UNION ALL
-			SELECT sr.name, NULL, {status.format(t='sr')}, sr.posting_date, i.warehouse, i.item_code,
-				i.current_qty, IFNULL(i.qty,0) - IFNULL(i.current_qty,0), i.valuation_rate,
-				IF(sr.purpose = 'Opening Stock', i.qty, NULL), 'Stock Reconciliation', i.idx
+			UNION ALL"""
+
+	rows = frappe.db.sql(
+		f"""
+		SELECT * FROM (
+			{se_branch}
+			SELECT sr.name AS slip_erp, NULL AS slip_animo, {status.format(t='sr')} AS status,
+				sr.posting_date, i.warehouse AS store, i.item_code, i.current_qty AS oh_qty,
+				IFNULL(i.qty,0) - IFNULL(i.current_qty,0) AS adj_qty, i.valuation_rate AS cost,
+				IF(sr.purpose = 'Opening Stock', i.qty, NULL) AS opening_stock,
+				'Stock Reconciliation' AS adj_type, i.idx
 			FROM `tabStock Reconciliation` sr
 			JOIN `tabStock Reconciliation Item` i ON i.parent = sr.name
 			WHERE sr.docstatus IN %(docstatus)s
@@ -349,6 +362,7 @@ def adjustments(from_date=None, to_date=None, limit=None, offset=None, docstatus
 		LIMIT %(lim)s OFFSET %(offset)s
 		""",
 		{
+			**adj_params,
 			"docstatus": _docstatus(docstatus),
 			"from_date": fd,
 			"to_date": td,
