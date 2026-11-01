@@ -42,6 +42,10 @@ SALES_INVOICE_ANIMO_FIELD = "po_no"
 # entries are then reported by the adjustments endpoint instead of transfers.
 ADJUSTMENT_DOC_PREFIXES = ()
 
+# Item images are stored as relative paths (/files/xxx.jpg) on Style Attribute Variant.
+# This host is prepended to give the complete URL.
+IMAGE_BASE_URL = "https://ecom.ozdah.com"
+
 DOCSTATUS_LABEL = {0: "Draft", 1: "Submitted", 2: "Cancelled"}
 
 
@@ -458,6 +462,7 @@ def inventory(limit=None, offset=None, warehouse=None, include_disabled=0, inclu
 	items = get_item_map(codes)
 	bins = _bin_totals(codes, warehouse)
 	po = _last_po_rate(codes)
+	images = _item_images(codes)
 
 	out = []
 	for r in page:
@@ -485,6 +490,7 @@ def inventory(limit=None, offset=None, warehouse=None, include_disabled=0, inclu
 				"barcode": r.barcode,
 				"custom_material": m.get("custom_material"),
 				"custom_image_url": m.get("custom_image_url"),
+				"image": images.get(r.item_code),
 				"custom_bin_no": m.get("custom_bin_no"),
 				"custom_dcs": m.get("custom_dcs"),
 				"custom_vendor_code": m.get("custom_vendor_code"),
@@ -514,6 +520,29 @@ def _bin_totals(codes, warehouse=None):
 			as_dict=True,
 		):
 			res[r.item_code] = (r.oh, r.po)
+	return res
+
+
+def _item_images(codes):
+	"""Complete URL of the first image of the Style Attribute Variant that lists each item."""
+	res = {}
+	codes = list(codes)
+	for i in range(0, len(codes), 2000):
+		for r in frappe.db.sql(
+			"""SELECT cs.item_code, si.image
+			FROM `tabColor Size Item` cs
+			JOIN `tabWebsite Slideshow Item` si ON si.parent = cs.parent
+				AND si.parenttype = 'Style Attribute Variant' AND si.parentfield = 'images'
+			WHERE cs.parenttype = 'Style Attribute Variant' AND cs.item_code IN %(codes)s
+				AND IFNULL(si.image, '') != ''
+			ORDER BY si.idx DESC""",
+			{"codes": tuple(codes[i : i + 2000])},
+			as_dict=True,
+		):
+			img = r.image.strip()
+			if not img.lower().startswith(("http://", "https://")):
+				img = IMAGE_BASE_URL.rstrip("/") + "/" + img.lstrip("/")
+			res[r.item_code] = img  # idx DESC order -> lowest idx (first image) wins
 	return res
 
 
